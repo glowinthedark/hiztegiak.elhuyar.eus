@@ -3,10 +3,11 @@
 
     ./elh.py sitemap                 enumerate headwords into work/cache.db
     ./elh.py pages [--langs eu,es]   fetch entry pages (skips what is cached)
-    ./elh.py audio                   plan + fetch headword TTS clips
-    ./elh.py build                   cache -> out/Elhuyar-<lang>/{text,media}.db
+    ./elh.py audio                   plan + fetch TTS clips (headwords+examples)
+    ./elh.py transcode               mp3 -> opus, cached back into cache.db
+    ./elh.py build                   cache -> out/<src>-<tgt>-Elhuyar/{text,media}.db
     ./elh.py status                  counts per stage
-    ./elh.py all                     sitemap + pages + audio + build
+    ./elh.py all                     sitemap + pages + audio + transcode + build
 
 Every stage is idempotent: the cache is the source of truth and re-running only
 does the work that is missing. --retry-failed re-attempts rows whose fetch gave
@@ -36,7 +37,7 @@ def _langs(s: str | None) -> tuple[str, ...]:
 def status(langs: tuple[str, ...]) -> None:
     db = cache()
     print(f"{'lang':<5}{'words':>9}{'fetched':>9}{'found':>9}{'miss':>8}"
-          f"{'failed':>8}{'tts':>9}{'clips':>8}{'noaudio':>9}")
+          f"{'failed':>8}{'heads':>9}{'examples':>10}{'clips':>9}{'opus':>9}{'noaudio':>9}")
     for lang in langs:
         g = lambda q: db.execute(q, (lang,)).fetchone()[0]  # noqa: E731
         print(f"{lang:<5}"
@@ -45,8 +46,10 @@ def status(langs: tuple[str, ...]) -> None:
               f"{g('SELECT count(*) FROM page WHERE lang=? AND found=1'):>9}"
               f"{g('SELECT count(*) FROM page WHERE lang=? AND found=0 AND status=200'):>8}"
               f"{g('SELECT count(*) FROM page WHERE lang=? AND status NOT IN (200,404)'):>8}"
-              f"{g('SELECT count(*) FROM ttsword WHERE lang=?'):>9}"
-              f"{g('SELECT count(*) FROM audio WHERE lang=? AND status=200'):>8}"
+              f"{g("SELECT count(*) FROM ttsword WHERE lang=? AND kind='w'"):>9}"
+              f"{g("SELECT count(*) FROM ttsword WHERE lang=? AND kind='x'"):>10}"
+              f"{g('SELECT count(*) FROM audio WHERE lang=? AND status=200'):>9}"
+              f"{g('SELECT count(*) FROM audio WHERE lang=? AND opus IS NOT NULL'):>9}"
               f"{g('SELECT count(*) FROM audio WHERE lang=? AND status<>200'):>9}")
 
 
@@ -54,9 +57,15 @@ def main() -> None:
     ap = argparse.ArgumentParser(prog="elh.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("sitemap", "pages", "audio", "build", "status", "all"):
+    for name in ("sitemap", "pages", "audio", "transcode", "build", "status", "all"):
         p = sub.add_parser(name)
         p.add_argument("--langs", help=LANGS_HELP)
+        if name in ("transcode", "all"):
+            p.add_argument("-j", "--jobs", type=int, default=0,
+                           help="ffmpeg workers (default: CPU count)")
+        if name == "transcode":
+            p.add_argument("--force", action="store_true",
+                           help="re-encode clips that already have opus")
         if name in ("pages", "audio", "all"):
             p.add_argument("-c", "--concurrency", type=int, default=16)
             p.add_argument("--retry-failed", action="store_true",
@@ -69,6 +78,9 @@ def main() -> None:
 
     if a.cmd == "status":
         return status(langs)
+    if a.cmd == "transcode":
+        import elh_transcode
+        return elh_transcode.transcode(langs, a.jobs, a.force)
     if a.cmd == "build":
         import elh_build
         for lang in langs:
@@ -85,10 +97,12 @@ def main() -> None:
         return asyncio.run(elh_fetch.audio(langs, a.concurrency, a.retry_failed))
     if a.cmd == "all":
         import elh_build
+        import elh_transcode
         asyncio.run(elh_fetch.sitemap(langs))
         asyncio.run(elh_fetch.pages(langs, a.concurrency, a.retry_failed))
         elh_fetch.plan_audio(langs)
         asyncio.run(elh_fetch.audio(langs, a.concurrency, a.retry_failed))
+        elh_transcode.transcode(langs, a.jobs)
         for lang in langs:
             elh_build.build(lang, limit=a.limit)
 

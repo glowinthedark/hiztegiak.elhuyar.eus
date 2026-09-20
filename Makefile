@@ -6,20 +6,23 @@ PY      ?= python3
 LANGS   ?= eu,es,en          # fr is opt-in: make pages LANGS=fr
 CONC    ?= 16
 LIMIT   ?= 0                 # build only N entries per language (smoke test)
+JOBS    ?=                   # ffmpeg workers for `opus` (default: CPU count)
+KBPS    ?= 24                # opus bitrate; 16 is smaller and audibly thinner
+HZ      ?= 16000             # opus sample rate; speech has nothing above 8 kHz
 ELH      = $(PY) elh.py
 WORK     = work
 OUT      = out
-DICTS    = $(OUT)/Elhuyar-eu $(OUT)/Elhuyar-es $(OUT)/Elhuyar-en
+DICTS    = $(OUT)/eu-es-Elhuyar $(OUT)/es-eu-Elhuyar $(OUT)/en-eu-Elhuyar
 RETRY    =                   # make pages RETRY=--retry-failed
 
 .DEFAULT_GOAL := help
-.PHONY: help deps sitemap pages audio build all status crawl log stop smoke \
+.PHONY: help deps sitemap pages audio opus build all status crawl log stop smoke \
         check install clean clean-out clean-all
 
 help:                       ## this list
 	@grep -hE '^[a-z-]+:.*##' $(MAKEFILE_LIST) \
 	 | sed 's/:.*##/\t/' | awk -F'\t' '{printf "  \033[1m%-12s\033[0m %s\n", $$1, $$2}'
-	@echo "  vars: LANGS=$(LANGS) CONC=$(CONC) LIMIT=$(LIMIT)"
+	@echo "  vars: LANGS=$(LANGS) CONC=$(CONC) LIMIT=$(LIMIT) KBPS=$(KBPS) HZ=$(HZ)"
 
 deps:                       ## install httpx + lxml into the active env
 	uv pip install httpx lxml
@@ -30,14 +33,23 @@ sitemap:                    ## enumerate headwords into work/cache.db (~30 s)
 pages:                      ## fetch entry pages (~2-8 h, resumable)
 	$(ELH) pages --langs $(LANGS) -c $(CONC) $(RETRY)
 
-audio:                      ## plan + fetch headword TTS mp3 (resumable)
+audio:                      ## plan + fetch TTS mp3, headwords + examples (resumable)
 	$(ELH) audio --langs $(LANGS) -c $(CONC) $(RETRY)
 
-build: | $(OUT)             ## cache -> out/Elhuyar-<lang>/{text,media}.db + info.txt
+# Cached back into work/cache.db, not produced during build: 262k ffmpeg runs
+# happen once, however often the dictionaries are rebuilt.  `make opus FORCE=1`
+# re-encodes after changing KBPS/HZ.
+opus:                       ## transcode the fetched mp3 to opus (16 kHz mono VoIP)
+	@command -v ffmpeg >/dev/null || { echo "ffmpeg not in PATH" >&2; exit 1; }
+	ELH_OPUS_KBPS=$(KBPS) ELH_OPUS_HZ=$(HZ) $(ELH) transcode --langs $(LANGS) \
+	  $(if $(JOBS),-j $(JOBS),) $(if $(FORCE),--force,)
+
+build: | $(OUT)             ## cache -> out/<src>-<tgt>-Elhuyar/{text,media}.db + info.txt
 	$(ELH) build --langs $(LANGS) --limit $(LIMIT)
 
-all:                        ## sitemap + pages + audio + build, in order
-	$(ELH) all --langs $(LANGS) -c $(CONC) $(RETRY) --limit $(LIMIT)
+all:                        ## sitemap + pages + audio + opus + build, in order
+	ELH_OPUS_KBPS=$(KBPS) ELH_OPUS_HZ=$(HZ) $(ELH) all --langs $(LANGS) -c $(CONC) \
+	  $(RETRY) $(if $(JOBS),-j $(JOBS),) --limit $(LIMIT)
 
 status:                     ## per-language counts for every stage
 	@$(ELH) status --langs $(LANGS)
@@ -45,14 +57,15 @@ status:                     ## per-language counts for every stage
 crawl:                      ## run pages+audio detached, logging to work/crawl.log
 	@mkdir -p $(WORK)
 	@nohup sh -c '$(ELH) pages --langs $(LANGS) -c $(CONC) && \
-	              $(ELH) audio --langs $(LANGS) -c $(CONC)' \
+	              $(ELH) audio --langs $(LANGS) -c $(CONC) && \
+	              ELH_OPUS_KBPS=$(KBPS) ELH_OPUS_HZ=$(HZ) $(ELH) transcode --langs $(LANGS)' \
 	        > $(WORK)/crawl.log 2>&1 & echo "detached: pid $$!  -> make log"
 
 log:                        ## tail the detached crawl log
 	@tail -f $(WORK)/crawl.log
 
 stop:                       ## stop a detached crawl (the cache keeps every page)
-	-@pkill -f 'elh.py (pages|audio|all)' && echo stopped || echo "nothing running"
+	-@pkill -f 'elh.py (pages|audio|transcode|all)' && echo stopped || echo "nothing running"
 
 smoke: | $(OUT)             ## 200-entry build, for checking format changes fast
 	$(ELH) build --langs $(LANGS) --limit 200

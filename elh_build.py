@@ -14,7 +14,8 @@ import sys
 import time
 import uuid as uuidlib
 
-from elh_common import (CACHE, DICT_DIR, DICT_NAME, OUT, PAIRS, cache, ungz)
+from elh_common import (CACHE, DICT_DIR, DICT_NAME, MP3_MIME, OPUS_MIME, OUT,
+                        PAIRS, cache, ungz)
 from elh_parse import CSS, audio_name, parse
 
 SCHEMA_VERSION = 1      # store.schemaVersion
@@ -63,6 +64,24 @@ def build(lang: str, outdir: str | None = None, limit: int = 0) -> None:
     media_path = os.path.join(outdir, "media.db")
     dict_uuid = uuidlib.uuid4().hex
 
+    # What can actually be played, decided once, before a single page is parsed:
+    # (lang, spoken text) -> (resource name | None, permanent online URL | None).
+    # Opus is preferred, mp3 is the fallback for a clip ffmpeg could not convert,
+    # and a row with neither still contributes its URL so the icon survives as an
+    # online-only link instead of being dropped.
+    media: dict[tuple[str, str], tuple[str | None, str | None]] = {}
+    for aword, url, has_opus, has_mp3 in src.execute(
+            "SELECT word, url, opus IS NOT NULL, status = 200 AND data IS NOT NULL "
+            "FROM audio WHERE lang = ?", (lang,)):
+        if has_opus:
+            name = audio_name(lang, aword, "opus")
+        elif has_mp3:
+            name = audio_name(lang, aword, "mp3")
+        else:
+            name = None
+        if name or url:
+            media[(lang, aword)] = (name, url)
+
     text = _fresh(text_path, TEXT_SCHEMA)
     q = ("SELECT word, gz FROM page WHERE lang = ? AND found = 1 ORDER BY word"
          + (f" LIMIT {int(limit)}" if limit else ""))
@@ -78,7 +97,7 @@ def build(lang: str, outdir: str | None = None, limit: int = 0) -> None:
     fbuf: list[tuple] = []
     for word, blob in rows:
         try:
-            got = parse(ungz(blob), lang)
+            got = parse(ungz(blob), lang, media)
         except Exception as exc:  # noqa: BLE001 - one malformed page is not a build failure
             print(f"\n  parse failed: {lang}/{word}: {exc!r}", file=sys.stderr)
             got = None
@@ -128,31 +147,35 @@ def build(lang: str, outdir: str | None = None, limit: int = 0) -> None:
     _finish(text, text_path)
 
     # ---- media -----------------------------------------------------------
-    media = _fresh(media_path, MEDIA_SCHEMA)
-    media.executemany("INSERT INTO meta(key, value) VALUES(?, ?)", [
+    mdb = _fresh(media_path, MEDIA_SCHEMA)
+    mdb.executemany("INSERT INTO meta(key, value) VALUES(?, ?)", [
         ("dict_uuid", dict_uuid), ("name", DICT_NAME[lang]), ("format", "html")])
-    media.execute("INSERT INTO resource(name, mime, data) VALUES(?, ?, ?)",
+    mdb.execute("INSERT INTO resource(name, mime, data) VALUES(?, ?, ?)",
                   ("elhuyar.css", "text/css; charset=utf-8", CSS.encode("utf-8")))
     clips = 0
-    missing = 0
+    online = 0
     mbuf: list[tuple] = []
-    have = {(l, w) for l, w in src.execute(
-        "SELECT lang, word FROM audio WHERE status = 200")}
     for alang, aword in sorted(wanted):
-        if (alang, aword) not in have:
-            missing += 1
+        name = media.get((alang, aword), (None, None))[0]
+        if name is None:
+            online += 1   # icon still works, over the network
             continue
-        row = src.execute("SELECT mime, data FROM audio WHERE lang = ? AND word = ?",
-                          (alang, aword)).fetchone()
-        mbuf.append((audio_name(alang, aword), row[0] or "audio/mpeg", row[1]))
+        opus, data = src.execute(
+            "SELECT opus, data FROM audio WHERE lang = ? AND word = ?",
+            (alang, aword)).fetchone()
+        blob = opus if name.endswith(".opus") else data
+        if not blob:
+            online += 1
+            continue
+        mbuf.append((name, OPUS_MIME if name.endswith(".opus") else MP3_MIME, blob))
         clips += 1
         if len(mbuf) >= 400:
-            media.executemany(
+            mdb.executemany(
                 "INSERT OR REPLACE INTO resource(name, mime, data) VALUES(?, ?, ?)", mbuf)
             mbuf.clear()
-    media.executemany(
+    mdb.executemany(
         "INSERT OR REPLACE INTO resource(name, mime, data) VALUES(?, ?, ?)", mbuf)
-    _finish(media, media_path)
+    _finish(mdb, media_path)
 
     tsize = os.path.getsize(text_path)
     msize = os.path.getsize(media_path)
@@ -166,7 +189,7 @@ name = {DICT_NAME[lang]}
 format = html
 entries = {entries}
 index = full text (headwords + article text)
-media = media.db ({msize/1e6:.1f} MB, {clips} pronunciation clips)
+media = media.db ({msize/1e6:.1f} MB, {clips} audio clips: headwords + examples)
 source = https://hiztegiak.elhuyar.eus/{lang}/
 pairs = {", ".join(PAIRS[lang])}
 body_encoding = plain (uncompressed)
@@ -177,4 +200,4 @@ uuid = {dict_uuid}
 """)
     print(f"{DICT_NAME[lang]}: {entries} entries ({tsize/1e6:.1f} MB), "
           f"{clips} clips ({msize/1e6:.1f} MB), {skipped} pages without an article, "
-          f"{missing} clips missing -> {outdir}")
+          f"{online} icons online-only -> {outdir}")

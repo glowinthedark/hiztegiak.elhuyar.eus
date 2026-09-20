@@ -3,13 +3,17 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import sqlite3
 import sys
 
 from elh_common import OUT
 
 
-def check(pattern: str = os.path.join(OUT, "Elhuyar-*")) -> int:
+HREF = re.compile(r'href="(audio/[^"]+)"')
+
+
+def check(pattern: str = os.path.join(OUT, "*-Elhuyar")) -> int:
     dirs = sorted(d for d in glob.glob(pattern)
                   if os.path.exists(os.path.join(d, "text.db")))
     if not dirs:
@@ -32,7 +36,21 @@ def check(pattern: str = os.path.join(OUT, "Elhuyar-*")) -> int:
         nul = one(t, "SELECT count(*) FROM entry WHERE substr(m, 1, 1) = char(0)")
         empty = one(t, "SELECT count(*) FROM entry WHERE m = '' OR w = ''")
         css = one(m, "SELECT count(*) FROM resource WHERE name = 'elhuyar.css'")
-        mp3 = one(m, "SELECT count(*) FROM resource WHERE name LIKE 'audio/%'")
+        clips = one(m, "SELECT count(*) FROM resource WHERE name LIKE 'audio/%'")
+        opus = one(m, "SELECT count(*) FROM resource WHERE name LIKE '%.opus'")
+        badmime = one(m, "SELECT count(*) FROM resource WHERE name LIKE '%.opus' "
+                        "AND mime <> 'audio/ogg'")
+        ogg = one(m, "SELECT count(*) FROM resource WHERE name LIKE '%.opus' "
+                     "AND substr(data, 1, 4) <> x'4F676753'")
+        # Every local audio href an article emits must resolve in media.db, or the
+        # icon is dead: the online fallback only fires for clips that HAVE a URL.
+        names = {r[0] for r in m.execute("SELECT name FROM resource")}
+        dangling = 0
+        fallback = 0
+        for (body,) in t.execute("SELECT m FROM entry ORDER BY id LIMIT 2000"):
+            for href in HREF.findall(body):
+                dangling += href not in names
+            fallback += body.count('data-u="')
         for ok, msg in (
             (one(t, "PRAGMA user_version") == 1, "text.db user_version != 1"),
             (one(m, "PRAGMA user_version") == 1, "media.db user_version != 1"),
@@ -44,14 +62,18 @@ def check(pattern: str = os.path.join(OUT, "Elhuyar-*")) -> int:
             (meta.get("body_encoding") == "plain", "meta.body_encoding != plain"),
             (meta.get("format") == "html", "meta.format != html"),
             (css == 1, "elhuyar.css missing from media.db"),
+            (badmime == 0, f"{badmime} .opus resources not served as audio/ogg"),
+            (ogg == 0, f"{ogg} .opus resources are not Ogg streams"),
+            (dangling == 0, f"{dangling} audio hrefs resolve to nothing in media.db"),
         ):
             if not ok:
                 print(f"  FAIL {os.path.basename(d)}: {msg}")
                 bad += 1
         size = sum(os.path.getsize(os.path.join(d, f))
                    for f in ("text.db", "media.db"))
-        print(f"{os.path.basename(d):<16} {n:>7} entries  {mp3:>7} clips  "
-              f"{res:>7} resources  {size/1e6:8.1f} MB  {meta.get('body_encoding')}")
+        print(f"{os.path.basename(d):<16} {n:>7} entries  {clips:>7} clips "
+              f"({opus} opus)  {res:>7} resources  {size/1e6:8.1f} MB  "
+              f"{meta.get('body_encoding')}  {fallback} fallbacks/2k entries")
     return 1 if bad else 0
 
 

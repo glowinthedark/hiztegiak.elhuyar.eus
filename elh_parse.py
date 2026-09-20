@@ -22,6 +22,13 @@ PAIR_LABEL = {
     "es_eu": "es &rsaquo; eu", "en_eu": "en &rsaquo; eu", "fr_eu": "fr &rsaquo; eu",
 }
 CREATE_AUDIO = re.compile(r"create_audio\(\s*'([a-z]{2})_[a-z]{2}'\s*,\s*'(.*?)'\s*\)")
+# create_audio_adibideak('eu','es','<origin>','<dest>');return false
+# Lazily grouped and anchored on the terminator: the site leaves apostrophes
+# UNESCAPED inside the dest argument, so quote counting mis-splits and a greedy
+# tail swallows every later call on the page. See elh_fetch.ADIB_RE.
+CREATE_ADIB = re.compile(
+    r"create_audio_adibideak\(\s*'([a-z]{2})'\s*,\s*'([a-z]{2})'\s*,"
+    r"\s*'(.*?)'\s*,\s*'(.*?)'\s*\)\s*;\s*return false", re.S)
 BWORD_HREF = re.compile(r'href="bword://([^"]*)"')
 ENTRY_HREF = re.compile(r"^/([a-z]{2})_[a-z]{2}/(.+)$")
 # Attributes that only ever carried behaviour, layout or page-local identity.
@@ -41,18 +48,40 @@ DROP_XPATH = (
     ".//a[starts-with(@href,'/proposamenak')]",
     ".//a[starts-with(@href,'/hitz-gakoak')]",
 )
-SPEAKER = "\U0001F50A"
+SPEAKER = "\U0001F50A"      # headword pronunciation
+SPEAKER_LOW = "\U0001F509"  # example sentence
+
+# Offline first, online second.  `onerror` rather than a rejected play()
+# promise: a rejection also means "autoplay blocked", which must NOT silently
+# re-fetch over the network, while onerror fires exactly when the local
+# resource is absent or undecodable - which is the case this exists for.
+#
+# This is an inline handler, not a <script>: wudict renders an article with a
+# <script> in a srcdoc iframe instead of the shadow DOM, which would cost the
+# host stylesheet and the lookup links.  Inline on* runs fine in a shadow root.
+FALLBACK_JS = (
+    "var t=this,a=new Audio(t.href);window._a=a;"
+    "a.onerror=function(){var u=t.getAttribute('data-u');"
+    "if(u){(window._a=new Audio(u)).play()}};a.play();return false"
+)
 
 
-def audio_name(lang: str, word: str) -> str:
+def audio_name(lang: str, word: str, ext: str = "opus") -> str:
     """Stable, filesystem- and URL-safe resource name for one spoken form.
 
     Hashed rather than slugged because headwords carry spaces, apostrophes,
     slashes and accents; a hash keeps the name wudict resolves byte-identical
     to the name stored in media.db, with no encoding round-trip to get wrong.
+
+    The extension is load-bearing for .opus: wudict's viewer rewrites any
+    assetExt href into /res/<dictID>/..., but its capture-phase audio handler
+    only claims (mp3|ogg|wav|spx|m4a).  .opus is in the first list and not the
+    second, so the click reaches our own onclick and the online fallback works.
+    A clip that could not be transcoded keeps .mp3 and is simply played by the
+    viewer's handler instead - no fallback, but the bytes are there.
     """
     h = hashlib.sha1(f"{lang}\x00{word}".encode("utf-8")).hexdigest()[:20]
-    return f"audio/{lang}/{h}.mp3"
+    return f"audio/{lang}/{h}.{ext}"
 
 
 def _drop(el) -> None:
@@ -96,7 +125,27 @@ def _unwrap(el) -> None:
     parent.remove(el)
 
 
-def _clean(node, audio: set[tuple[str, str]]) -> None:
+def _resolve(media, lang: str, text: str):
+    """One spoken form -> (href, online_url) or None when nothing can play it.
+
+    `media` is the build's view of what actually made it into media.db:
+    (lang, text) -> (resource_name | None, online_url | None).  None means
+    "assume everything is local", which is what a bare parse() wants.
+    """
+    if media is None:
+        return audio_name(lang, text), None
+    got = media.get((lang, text))
+    if not got:
+        return None
+    name, url = got
+    if name:
+        return name, url
+    # No bytes, but the synthesizer handed us a permanent URL for this exact
+    # string: an online-only icon still beats no icon.
+    return (url, None) if url else None
+
+
+def _clean(node, audio: set[tuple[str, str]], media=None) -> None:
     for xp in DROP_XPATH:
         for el in node.xpath(xp):
             _drop(el)
@@ -107,27 +156,29 @@ def _clean(node, audio: set[tuple[str, str]]) -> None:
     for el in node.xpath(".//button"):
         _unwrap(el)
 
+    # Deferred: the attribute sweep below strips on* and data-* wholesale, so
+    # the audio anchors are emptied here and dressed after it has run.
+    pending: list[tuple] = []
     for a in node.xpath(".//a"):
         onclick = a.get("onclick", "") or ""
         href = (a.get("href") or "").strip()
         hit = CREATE_AUDIO.search(onclick)
-        if hit:  # headword pronunciation -> a real link into media.db
-            lang, word = hit.group(1), hit.group(2).replace("\\'", "'").replace("\\\\", "\\")
-            word = word.strip()
-            if not word:
+        adib = None if hit else CREATE_ADIB.search(onclick)
+        if hit or adib:
+            if hit:
+                lang, word, kind = hit.group(1), hit.group(2), "w"
+            else:
+                lang, word, kind = adib.group(1), adib.group(3), "x"
+            word = word.replace("\\'", "'").replace("\\\\", "\\").strip()
+            got = _resolve(media, lang, word) if word else None
+            if got is None:
                 _drop(a)
                 continue
             audio.add((lang, word))
             for kid in list(a):
                 _drop(kid)
             a.attrib.clear()
-            a.set("href", audio_name(lang, word))
-            a.set("class", "wu-audio elh-tts")
-            a.set("title", "Ahoskera / pronunciation")
-            a.text = SPEAKER
-            continue
-        if "create_audio_adibideak" in onclick:
-            _drop(a)  # example-sentence TTS is a POST API; not captured
+            pending.append((a, kind, *got))
             continue
         ref = ENTRY_HREF.match(href)
         if ref:  # cross-reference to another entry -> wudict headword lookup
@@ -162,13 +213,33 @@ def _clean(node, audio: set[tuple[str, str]]) -> None:
     for el in node.xpath(".//i[not(node())]"):
         _drop(el)
 
+    for a, kind, href, url in pending:
+        a.set("href", href)
+        if url:
+            a.set("data-u", url)
+            a.set("onclick", FALLBACK_JS)
+        if kind == "w":
+            a.set("class", "wu-audio elh-tts")
+            a.set("title", "Ahoskera / pronunciation")
+            a.text = SPEAKER
+        else:
+            a.set("class", "wu-audio elh-ex")
+            a.set("title", "Adibidea entzun / play example")
+            a.text = SPEAKER_LOW
+
 
 def _html(node) -> str:
     return etree.tostring(node, encoding="unicode", method="html")
 
 
-def parse(page_html: str, lang: str) -> tuple[str, str, set[tuple[str, str]]] | None:
-    """Return (article_html, plain_text, audio_refs) or None when there is no entry."""
+def parse(page_html: str, lang: str,
+          media=None) -> tuple[str, str, set[tuple[str, str]]] | None:
+    """Return (article_html, plain_text, audio_refs) or None when there is no entry.
+
+    `media` maps (lang, spoken text) -> (resource name | None, online URL | None)
+    and decides, per icon, whether it links a local clip (with an online
+    fallback), links straight out to the network, or is dropped entirely.
+    """
     doc = lxml.html.fromstring(page_html)
     main = doc.xpath("//*[@id='erdiko_zutabea']")
     if not main:
@@ -186,7 +257,7 @@ def parse(page_html: str, lang: str) -> tuple[str, str, set[tuple[str, str]]] | 
         body: list[str] = []
         for node in nodes:
             node = lxml.html.fromstring(_html(node))
-            _clean(node, audio)
+            _clean(node, audio, media)
             for h1 in node.xpath(".//h1"):
                 h1.tag = "div"
                 h1.set("class", "wu-k elh-hw")
@@ -229,8 +300,11 @@ CSS = """/* Elhuyar hiztegiak - offline article styles (wudict) */
 .elh em { color: #1f6f6b; font-style: italic; }
 .elh a.wu-xref { text-decoration: none; }
 .elh a.wu-xref strong { font-weight: 600; }
-.elh a.elh-tts { text-decoration: none; font-size: .9em; margin-left: .35em; opacity: .75; }
-.elh a.elh-tts:hover { opacity: 1; }
+.elh a.elh-tts, .elh a.elh-ex { text-decoration: none; margin-left: .35em; opacity: .75;
+  cursor: pointer; }
+.elh a.elh-tts { font-size: .9em; }
+.elh a.elh-ex { font-size: .78em; opacity: .55; }
+.elh a.elh-tts:hover, .elh a.elh-ex:hover { opacity: 1; }
 .elh .padDefn { margin-left: 1.1em; }
 .elh .text-muted { color: #6b7280; font-size: .95em; }
 .elh .azpisarrera, .elh .adibideak { margin-left: 1em; }
