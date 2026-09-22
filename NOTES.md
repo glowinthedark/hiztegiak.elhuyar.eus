@@ -164,10 +164,17 @@ with `StripHTML(body)` — required at `ingest_level = "text"`.
   rewritten to `/res/<dictID>/<name>` and looked up in `media.db.resource.name`.
   Hence articles reference `audio/<lang>/<sha1[:20]>.mp3` and `elhuyar.css`, and
   those exact strings are the resource keys.
-- `bword://<headword>` is a lookup link, **parsed by string position and never
-  percent-decoded**. lxml escapes spaces/non-ASCII when serializing `href`, so
-  `elh_parse.parse()` un-escapes `bword://` targets afterwards. Regression
-  check: `bword://pajaro tejedor` must appear literally, not `%20`.
+- `entry://<headword>` is a lookup link, **split by string position, not by
+  `new URL()`** (`REF_SCHEME` in `web/index.html`): an authority cannot hold the
+  spaces and apostrophes headwords carry. wudict accepts `bword:`, `bword://`,
+  `entry:`, `entry://`, `d:` and `x:` interchangeably and leaves all of them
+  untouched in `rewrite.go`; `entry://` is emitted because it is the MDict
+  spelling any downstream MDX/GoldenDict-ng conversion expects, whereas
+  `bword://word` (two slashes) is the form GoldenDict itself mis-parses as an
+  empty authority (goldendict#1384). lxml escapes spaces/non-ASCII when
+  serializing `href`, so `elh_parse.parse()` un-escapes lookup targets
+  afterwards. Regression check: `entry://pajaro tejedor` must appear literally,
+  not `%20`.
 - Role classes are `wu-`-prefixed: `wu-k` (headword), `wu-audio`, `wu-xref`,
   `wu-ex`.
 

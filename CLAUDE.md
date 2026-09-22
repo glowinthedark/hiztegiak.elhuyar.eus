@@ -65,8 +65,9 @@ Install once: `uv pip install httpx lxml`.
   so the article's own inline `onclick` fallback still fires.
 - wudict reads a body as compressed only when it starts with `0x00`; plain
   UTF-8 HTML is therefore format-legal and satisfies "no compression".
-- `bword://` lookup links are parsed by string position and are **never
-  percent-decoded** — `elh_parse` un-escapes them after serialization.
+- `entry://` lookup links are split by string position (wudict takes `bword:`
+  and `entry:`, with or without `//`, identically) — `elh_parse` un-escapes
+  them after serialization.
 
 ## User decisions already taken (do not re-ask)
 

@@ -29,7 +29,7 @@ CREATE_AUDIO = re.compile(r"create_audio\(\s*'([a-z]{2})_[a-z]{2}'\s*,\s*'(.*?)'
 CREATE_ADIB = re.compile(
     r"create_audio_adibideak\(\s*'([a-z]{2})'\s*,\s*'([a-z]{2})'\s*,"
     r"\s*'(.*?)'\s*,\s*'(.*?)'\s*\)\s*;\s*return false", re.S)
-BWORD_HREF = re.compile(r'href="bword://([^"]*)"')
+LOOKUP_HREF = re.compile(r'href="entry://([^"]*)"')
 ENTRY_HREF = re.compile(r"^/([a-z]{2})_[a-z]{2}/(.+)$")
 # Attributes that only ever carried behaviour, layout or page-local identity.
 DROP_ATTRS = ("onclick", "onload", "style", "target", "id", "name", "data-toggle",
@@ -184,7 +184,7 @@ def _clean(node, audio: set[tuple[str, str]], media=None) -> None:
         if ref:  # cross-reference to another entry -> wudict headword lookup
             target = ref.group(2)
             a.attrib.clear()
-            a.set("href", "bword://" + target)
+            a.set("href", "entry://" + target)
             a.set("class", "wu-xref")
             continue
         if href.startswith(("#", "javascript:")) or not href:
@@ -275,11 +275,16 @@ def parse(page_html: str, lang: str,
         return None
     article = ('<link rel="stylesheet" href="elhuyar.css">'
                '<div class="elh">' + "".join(sections) + "</div>")
-    # `bword://Some Headword` IS NOT A URL - wudict parses it by string position
-    # and never percent-decodes it (server/web/index.html). lxml's serializer
-    # escapes spaces and non-ASCII in href, so undo that for lookup targets only.
-    article = BWORD_HREF.sub(
-        lambda m: 'href="bword://' + unquote(m.group(1)) + '"', article)
+    # `entry://Some Headword` IS NOT A URL - wudict splits it by string position
+    # before decoding (REF_SCHEME in server/web/index.html), and an authority
+    # may not hold the spaces, apostrophes and ampersands headwords are full of.
+    # lxml's serializer percent-escapes spaces and non-ASCII in href, so undo
+    # that for lookup targets only. `entry://` over `bword://`: wudict accepts
+    # both identically, and entry:// is the MDict spelling any downstream MDX
+    # conversion expects, while `bword://word` (two slashes) is the form that
+    # trips GoldenDict's own authority parse.
+    article = LOOKUP_HREF.sub(
+        lambda m: 'href="entry://' + unquote(m.group(1)) + '"', article)
     text = lxml.html.fromstring(article).text_content()
     text = re.sub(r"\s+", " ", text).strip()
     return article, text, audio
